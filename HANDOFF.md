@@ -386,6 +386,9 @@ Claude・ChatGPT議論      ✅ 自動
 
 ### 2026/3/16 — APIキー修正後の再テスト (#2)
 
+### 2026/3/16 — NOTION_PAGE_ID更新後のNotion記録テスト (#3)
+- 書き込み先: 325275cc-ca58-810a-ab86-cb766a94c935
+- 
 - 機密情報（APIキー等）は GitHub に書かない
 - 開発ログは日付付きで末尾に追記していく
 - Notion が正（マスター）、HANDOFF.md はClaudeへの橋渡し用コピー
