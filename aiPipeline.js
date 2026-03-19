@@ -1,143 +1,294 @@
 /**
- * aiPipeline.js - AI自律開発パイプライン（新モデル）
+ * aiPipeline.js - AI自律開発システム 新パイプライン
  * 
- * フロー:
- * 1. Notion からタスク/調査依頼を読み取り
- * 2. ChatGPT API でリアルタイム調査（後でPerplexityに差し替え可能）
- * 3. Claude API で設計・実装 + セルフレビュー
- * 4. Notion に結果を保存
+ * 新モデル（Claude主体 + Perplexity補助）:
+ * 1. HANDOFF.md を読み取る
+ * 2. Perplexity API でWeb検索（補助情報収集）
+ * 3. Claude API に HANDOFF.md + Perplexity結果を送信 → 一次回答を取得
+ * 4. 結果を Notion に保存
+ * 
+ * 旧モデル（aiRelay.js）との違い:
+ * - ChatGPT を除外（Claude が主体的に設計・実行）
+ * - Perplexity を追加（リアルタイムWeb検索で補助情報を提供）
+ * - Claude が一次回答 + 自己レビューまで担当
  */
 
+const fs = require('fs');
 const Anthropic = require('@anthropic-ai/sdk');
-const OpenAI = require('openai');
 const { Client } = require('@notionhq/client');
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const notion = new Client({ auth: process.env.NOTION_API_KEY });
-const NOTION_PAGE_ID = process.env.NOTION_PAGE_ID;
+// ===== 設定 =====
+const anthropic = new Anthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY,
+});
 
-// 1. Notionからタスクを読み取り
-async function readNotionTask() {
-  console.log('📖 Notionからタスクを読み取り中...');
-  try {
-    const blocks = await notion.blocks.children.list({ block_id: NOTION_PAGE_ID, page_size: 50 });
-    let content = '';
-    for (const block of blocks.results) {
-      if (block.type === 'paragraph' && block.paragraph.rich_text.length > 0)
-        content += block.paragraph.rich_text.map(t => t.plain_text).join('') + '\n';
-      else if (block.type === 'heading_2' && block.heading_2.rich_text.length > 0)
-        content += '## ' + block.heading_2.rich_text.map(t => t.plain_text).join('') + '\n';
-      else if (block.type === 'heading_3' && block.heading_3.rich_text.length > 0)
-        content += '### ' + block.heading_3.rich_text.map(t => t.plain_text).join('') + '\n';
-      else if (block.type === 'bulleted_list_item' && block.bulleted_list_item.rich_text.length > 0)
-        content += '- ' + block.bulleted_list_item.rich_text.map(t => t.plain_text).join('') + '\n';
+const notion = new Client({
+  auth: process.env.NOTION_API_KEY,
+});
+
+const NOTION_PAGE_ID = process.env.NOTION_PAGE_ID;
+const PERPLEXITY_API_KEY = process.env.PERPLEXITY_API_KEY;
+
+// ===== HANDOFF.md を読み取る =====
+function readHandoff() {
+  const handoffPath = './HANDOFF.md';
+  if (!fs.existsSync(handoffPath)) {
+    console.error('❌ HANDOFF.md が見つかりません');
+    process.exit(1);
+  }
+  const content = fs.readFileSync(handoffPath, 'utf-8');
+  console.log('✅ HANDOFF.md を読み取りました（' + content.length + '文字）');
+  return content;
+}
+
+// ===== HANDOFF.md からタスクを抽出 =====
+function extractTask(handoffContent) {
+  // 「📌 次回やること」「## 次にやること」などのセクションを探す
+  const patterns = [
+    /📌\s*次回やること[\s\S]*?(?=\n##|\n---|\n📌|$)/,
+    /##\s*次にやること[\s\S]*?(?=\n##|\n---|\n📌|$)/,
+    /##\s*現在のタスク[\s\S]*?(?=\n##|\n---|\n📌|$)/,
+    /##\s*TODO[\s\S]*?(?=\n##|\n---|\n📌|$)/,
+  ];
+
+  for (const pattern of patterns) {
+    const match = handoffContent.match(pattern);
+    if (match) {
+      return match[0].trim();
     }
-    console.log('✅ Notion読み取り完了（' + content.length + '文字）');
-    return content;
+  }
+
+  // タスクセクションが見つからない場合は全文を使う
+  console.log('⚠️ タスクセクションが見つからないため、HANDOFF.md全文を使用します');
+  return handoffContent;
+}
+
+// ===== Perplexity API でWeb検索（補助情報収集） =====
+async function searchWithPerplexity(task) {
+  if (!PERPLEXITY_API_KEY) {
+    console.log('⚠️ PERPLEXITY_API_KEY が未設定のため、Web検索をスキップします');
+    return null;
+  }
+
+  console.log('🔍 Perplexity でWeb検索中...');
+
+  try {
+    const response = await fetch('https://api.perplexity.ai/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${PERPLEXITY_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'sonar-pro',
+        messages: [
+          {
+            role: 'system',
+            content: 'あなたは開発タスクの補助リサーチャーです。与えられたタスクに関連する最新の技術情報、ベストプラクティス、APIドキュメント等を調査して、簡潔にまとめてください。日本語で回答してください。'
+          },
+          {
+            role: 'user',
+            content: `以下の開発タスクに関連する技術情報を調査してください:\n\n${task}`
+          }
+        ],
+        max_tokens: 2000,
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('⚠️ Perplexity APIエラー:', response.status, errorText);
+      return null;
+    }
+
+    const data = await response.json();
+    const result = data.choices[0].message.content;
+    const citations = data.citations || [];
+
+    console.log('✅ Perplexity の調査結果を取得しました（' + result.length + '文字）');
+
+    let output = result;
+    if (citations.length > 0) {
+      output += '\n\n参考文献:\n' + citations.map((c, i) => `[${i + 1}] ${c}`).join('\n');
+    }
+
+    return output;
   } catch (error) {
-    console.error('❌ Notion読み取りエラー:', error.message);
+    console.error('⚠️ Perplexity 検索エラー（スキップします）:', error.message);
     return null;
   }
 }
 
-// 2. ChatGPTで調査（後でPerplexityに差し替え可能）
-async function research(taskContent) {
-  console.log('🔍 ChatGPTで調査中...');
-  try {
-    const response = await openai.chat.completions.create({
-      model: 'gpt-4o',
-      messages: [
-        { role: 'system', content: 'あなたはマーケティングリサーチの専門家です。与えられたタスクに関連する市場調査、競合分析、トレンド分析を行ってください。回答は日本語で、具体的なデータや数字を含めてください。' },
-        { role: 'user', content: '以下のタスク/プロジェクト内容に基づいて、関連する市場調査を行ってください。\n\n' + taskContent }
-      ],
-      max_tokens: 2000,
-    });
-    const result = response.choices[0].message.content;
-    console.log('✅ ChatGPT調査完了（' + result.length + '文字）');
-    return result;
-  } catch (error) {
-    console.error('❌ ChatGPT調査エラー:', error.message);
-    return '調査をスキップしました: ' + error.message;
+// ===== Claude API 呼び出し（主体的な設計・実行） =====
+async function askClaude(handoffContent, task, perplexityResult) {
+  console.log('🧠 Claude に送信中...');
+
+  // Perplexityの結果がある場合は補助情報として追加
+  let supplementary = '';
+  if (perplexityResult) {
+    supplementary = `\n\n## 🔍 Perplexityによる補助調査結果\n${perplexityResult}`;
   }
+
+  const message = await anthropic.messages.create({
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: 8192,
+    system: `あなたはAI自律開発システムの「主任エンジニア」です。
+
+## あなたの役割
+- HANDOFF.md の内容を読み、タスクを理解する
+- Perplexityの調査結果（あれば）を参考にする
+- 具体的な設計案・実装コード・次のアクションを提案する
+- 自分の提案を自己レビューし、問題点があれば修正する
+
+## 出力フォーマット
+以下のセクションで回答してください:
+
+### 📋 タスク理解
+（何をやるべきか、簡潔に）
+
+### 🏗️ 設計・実装
+（具体的な提案、コードがあればコードも）
+
+### ✅ 自己レビュー
+（自分の提案の良い点・懸念点・改善案）
+
+### 📌 次回やること
+（このタスクの次のステップ）
+
+回答は日本語でお願いします。`,
+    messages: [
+      {
+        role: 'user',
+        content: `以下はHANDOFF.md の内容です。タスクを理解して、設計・実装を進めてください。\n\n## HANDOFF.md全文\n${handoffContent}\n\n## 抽出されたタスク\n${task}${supplementary}`
+      }
+    ]
+  });
+
+  const claudeResponse = message.content[0].text;
+  console.log('✅ Claude の回答を取得しました（' + claudeResponse.length + '文字）');
+  return claudeResponse;
 }
 
-// 3. Claudeで設計・実装 + セルフレビュー
-async function designAndReview(taskContent, researchResult) {
-  console.log('🧠 Claudeで設計中...');
-  const designResponse = await anthropic.messages.create({
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: 4096,
-    system: 'あなたはAI自律開発システムの設計・実装担当です。タスク内容と調査結果を読んで、具体的な設計案または実装案を作成してください。コードが必要な場合はコードも書いてください。回答は日本語で。',
-    messages: [{ role: 'user', content: '## タスク内容\n' + taskContent + '\n\n## 調査結果\n' + researchResult + '\n\nこれらを踏まえて、具体的な設計案または実装案を作成してください。' }],
-  });
-  const designResult = designResponse.content[0].text;
-  console.log('✅ Claude設計完了（' + designResult.length + '文字）');
+// ===== Notion に保存 =====
+async function saveToNotion(claudeResponse, perplexityResult, task) {
+  console.log('📝 Notion に保存中...');
 
-  console.log('🔄 Claudeでセルフレビュー中...');
-  const reviewResponse = await anthropic.messages.create({
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: 2048,
-    system: 'あなたは厳格なコードレビュアー・設計批評家です。以下の設計案を批判的にレビューしてください。良い点、問題点、改善提案をそれぞれ具体的に指摘してください。甘い評価は不要です。回答は日本語で。',
-    messages: [{ role: 'user', content: '## 元のタスク\n' + taskContent + '\n\n## 設計案\n' + designResult + '\n\nこの設計案をレビューしてください。' }],
-  });
-  const reviewResult = reviewResponse.content[0].text;
-  console.log('✅ セルフレビュー完了（' + reviewResult.length + '文字）');
-  return { design: designResult, review: reviewResult };
-}
+  const now = new Date();
+  const timestamp = now.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
+  const title = `AI Pipeline ${timestamp}`;
 
-// 4. Notionに結果を保存
-async function saveToNotion(researchResult, designResult, reviewResult) {
-  console.log('📝 Notionに保存中...');
-  const now = new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
+  // Notion のブロック（children）を構築
+  const children = [
+    {
+      object: 'block',
+      type: 'heading_2',
+      heading_2: {
+        rich_text: [{ text: { content: '📋 タスク' } }]
+      }
+    },
+    {
+      object: 'block',
+      type: 'paragraph',
+      paragraph: {
+        rich_text: [{ text: { content: task.substring(0, 2000) } }]
+      }
+    },
+  ];
+
+  // Perplexity結果があれば追加
+  if (perplexityResult) {
+    children.push(
+      {
+        object: 'block',
+        type: 'heading_2',
+        heading_2: {
+          rich_text: [{ text: { content: '🔍 Perplexity 調査結果' } }]
+        }
+      },
+      {
+        object: 'block',
+        type: 'paragraph',
+        paragraph: {
+          rich_text: [{ text: { content: perplexityResult.substring(0, 2000) } }]
+        }
+      }
+    );
+  }
+
+  // Claude回答を追加
+  children.push(
+    {
+      object: 'block',
+      type: 'heading_2',
+      heading_2: {
+        rich_text: [{ text: { content: '🧠 Claude の回答（設計・実装）' } }]
+      }
+    },
+    {
+      object: 'block',
+      type: 'paragraph',
+      paragraph: {
+        rich_text: [{ text: { content: claudeResponse.substring(0, 2000) } }]
+      }
+    }
+  );
+
   try {
     await notion.pages.create({
       parent: { page_id: NOTION_PAGE_ID },
-      properties: { title: { title: [{ text: { content: 'AI Pipeline ' + now } }] } },
-      children: [
-        { object: 'block', type: 'heading_2', heading_2: { rich_text: [{ type: 'text', text: { content: '🔍 調査結果（ChatGPT）' } }] } },
-        { object: 'block', type: 'paragraph', paragraph: { rich_text: [{ type: 'text', text: { content: researchResult.substring(0, 2000) } }] } },
-        { object: 'block', type: 'divider', divider: {} },
-        { object: 'block', type: 'heading_2', heading_2: { rich_text: [{ type: 'text', text: { content: '🧠 設計案（Claude）' } }] } },
-        { object: 'block', type: 'paragraph', paragraph: { rich_text: [{ type: 'text', text: { content: designResult.substring(0, 2000) } }] } },
-        { object: 'block', type: 'divider', divider: {} },
-        { object: 'block', type: 'heading_2', heading_2: { rich_text: [{ type: 'text', text: { content: '🔄 セルフレビュー（Claude）' } }] } },
-        { object: 'block', type: 'paragraph', paragraph: { rich_text: [{ type: 'text', text: { content: reviewResult.substring(0, 2000) } }] } },
-      ]
+      properties: {
+        title: {
+          title: [{ text: { content: title } }]
+        }
+      },
+      children: children
     });
-    console.log('✅ Notion保存完了: AI Pipeline ' + now);
+
+    console.log('✅ Notion に保存しました: ' + title);
   } catch (error) {
-    console.error('❌ Notionエラー:', error.message);
+    console.error('❌ Notion 保存エラー:', error.message);
   }
 }
 
-// メイン実行
+// ===== メイン処理 =====
 async function main() {
-  console.log('🚀 aiPipeline.js 開始（新モデル: Notion → ChatGPT調査 → Claude設計+レビュー → Notion）');
+  console.log('🚀 AI自律開発システム - aiPipeline.js 開始（新モデル）');
+  console.log('='.repeat(50));
+  console.log('モデル: Claude（主体） + Perplexity（補助）');
+  console.log('='.repeat(50));
+
   try {
-    const taskContent = await readNotionTask();
-    if (!taskContent) {
-      console.log('⚠️ Notionからタスクを取得できません。HANDOFF.mdにフォールバック。');
-      const fs = require('fs');
-      const handoff = fs.existsSync('./HANDOFF.md') ? fs.readFileSync('./HANDOFF.md', 'utf-8') : '';
-      if (!handoff) { console.error('❌ HANDOFF.mdも見つかりません。終了。'); process.exit(1); }
-      const res = await research(handoff);
-      const { design, review } = await designAndReview(handoff, res);
-      await saveToNotion(res, design, review);
-      return;
-    }
-    const researchResult = await research(taskContent);
-    const { design, review } = await designAndReview(taskContent, researchResult);
-    await saveToNotion(researchResult, design, review);
+    // 1. HANDOFF.md を読み取る
+    const handoffContent = readHandoff();
+
+    // 2. タスクを抽出
+    const task = extractTask(handoffContent);
+    console.log('📋 タスク抽出完了（' + task.length + '文字）');
+
+    // 3. Perplexity でWeb検索（補助）
+    const perplexityResult = await searchWithPerplexity(task);
+
+    // 4. Claude に設計・実装を依頼
+    const claudeResponse = await askClaude(handoffContent, task, perplexityResult);
+
+    // 5. Notion に保存
+    await saveToNotion(claudeResponse, perplexityResult, task);
+
+    // 6. 結果サマリーを出力
     console.log('\n' + '='.repeat(50));
     console.log('📋 パイプライン結果サマリー');
     console.log('='.repeat(50));
-    console.log('\n🔍 調査:', researchResult.substring(0, 300) + '...');
-    console.log('\n🧠 設計:', design.substring(0, 300) + '...');
-    console.log('\n🔄 レビュー:', review.substring(0, 300) + '...');
+    console.log('\n🧠 Claude:');
+    console.log(claudeResponse.substring(0, 500) + '...');
+    if (perplexityResult) {
+      console.log('\n🔍 Perplexity:');
+      console.log(perplexityResult.substring(0, 300) + '...');
+    }
     console.log('\n✅ aiPipeline.js 完了');
+
   } catch (error) {
-    console.error('❌ エラー:', error.message);
+    console.error('❌ エラーが発生しました:', error.message);
+    console.error(error.stack);
     process.exit(1);
   }
 }

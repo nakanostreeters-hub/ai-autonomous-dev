@@ -1,14 +1,14 @@
 {
   "name": "ai-autonomous-dev",
-  "version": "1.0.0",
-  "description": "AI自律開発システム - Claude & ChatGPT 自動議論エンジン",
-  "main": "aiRelay.js",
+  "version": "2.0.0",
+  "description": "AI自律開発システム - Claude主体 + Perplexity補助パイプライン",
+  "main": "aiPipeline.js",
   "scripts": {
-    "start": "node aiRelay.js"
+    "start": "node aiPipeline.js",
+    "start:old": "node aiRelay.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
-    "openai": "^4.77.0",
     "@notionhq/client": "^2.2.15"
   }
 }

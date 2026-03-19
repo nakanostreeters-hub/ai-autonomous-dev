@@ -1,4 +1,4 @@
-name: AI Pipeline - Notion → ChatGPT調査 → Claude設計
+name: AI Pipeline - Claude主体パイプライン
 
 on:
   push:
@@ -6,12 +6,11 @@ on:
       - 'HANDOFF.md'
     branches:
       - main
-  workflow_dispatch:
 
 jobs:
-  ai-pipeline:
+  run-pipeline:
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: リポジトリをチェックアウト
         uses: actions/checkout@v4
@@ -19,7 +18,7 @@ jobs:
       - name: Node.js セットアップ
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '20'
 
       - name: 依存パッケージインストール
         run: npm install
@@ -27,7 +26,9 @@ jobs:
       - name: aiPipeline.js 実行
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
           NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
           NOTION_PAGE_ID: ${{ secrets.NOTION_PAGE_ID }}
+          GITHUB_OWNER: ${{ secrets.GH_OWNER }}
+          GITHUB_REPO: ${{ secrets.GH_REPO }}
         run: node aiPipeline.js
