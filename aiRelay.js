@@ -10,13 +10,35 @@
 
 const fs = require('fs');
 const Anthropic = require('@anthropic-ai/sdk');
-const OpenAI = require('openai');
 const { Client } = require('@notionhq/client');
 
+// OpenAI はオプショナル（インストールされていない場合はClaude単体モードで動作）
+let OpenAI;
+try {
+  OpenAI = require('openai');
+} catch {
+  console.log('⚠️ openai パッケージが見つかりません。Claude 単体モードで動作します。');
+}
+
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const openai = OpenAI && process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
 const notion = new Client({ auth: process.env.NOTION_API_KEY });
 const NOTION_PAGE_ID = process.env.NOTION_PAGE_ID;
+
+// Notion rich_text の2000文字制限を回避するため、テキストを複数パラグラフブロックに分割
+function splitToNotionBlocks(text, limit = 2000) {
+  const blocks = [];
+  for (let i = 0; i < text.length; i += limit) {
+    blocks.push({
+      object: 'block',
+      type: 'paragraph',
+      paragraph: {
+        rich_text: [{ text: { content: text.substring(i, i + limit) } }]
+      }
+    });
+  }
+  return blocks;
+}
 
 function readHandoff() {
   const path = './HANDOFF.md';
@@ -40,6 +62,10 @@ async function askClaude(handoff) {
 }
 
 async function askChatGPT(handoff, claudeRes) {
+  if (!openai) {
+    console.log('⚠️ OpenAI が利用できないため、ChatGPT 批評をスキップします');
+    return '（ChatGPT 批評なし — Claude 単体モードで実行）';
+  }
   console.log('🔍 ChatGPT に送信中...');
   const comp = await openai.chat.completions.create({
     model: 'gpt-4o',
@@ -64,9 +90,9 @@ async function saveToNotion(claudeRes, gptRes) {
       properties: { title: { title: [{ text: { content: 'AI議論 ' + ts } }] } },
       children: [
         { object: 'block', type: 'heading_2', heading_2: { rich_text: [{ text: { content: '🧠 Claude の回答' } }] } },
-        { object: 'block', type: 'paragraph', paragraph: { rich_text: [{ text: { content: claudeRes.substring(0, 2000) } }] } },
+        ...splitToNotionBlocks(claudeRes),
         { object: 'block', type: 'heading_2', heading_2: { rich_text: [{ text: { content: '🔍 ChatGPT の批評' } }] } },
-        { object: 'block', type: 'paragraph', paragraph: { rich_text: [{ text: { content: gptRes.substring(0, 2000) } }] } }
+        ...splitToNotionBlocks(gptRes),
       ]
     });
     console.log('✅ Notion 保存完了: AI議論 ' + ts);
